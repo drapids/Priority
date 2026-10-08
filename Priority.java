@@ -1,5 +1,7 @@
 package org.firstinspires.ftc.teamcode;
 
+import android.graphics.Color;
+
 import com.qualcomm.hardware.lynx.LynxModule;
 import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
@@ -8,7 +10,10 @@ import com.qualcomm.robotcore.hardware.CRServo;
 import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
+import com.qualcomm.robotcore.hardware.DistanceSensor;
 import com.qualcomm.robotcore.hardware.IMU;
+import com.qualcomm.robotcore.hardware.NormalizedColorSensor;
+import com.qualcomm.robotcore.hardware.NormalizedRGBA;
 import com.qualcomm.robotcore.hardware.PIDFCoefficients;
 import com.qualcomm.robotcore.hardware.VoltageSensor;
 import com.qualcomm.robotcore.util.ElapsedTime;
@@ -16,11 +21,16 @@ import com.qualcomm.robotcore.util.Range;
 
 import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.CurrentUnit;
+import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
 
 import java.util.List;
 
 @TeleOp(name = "Priority", group = "Competition")
 public class Priority extends OpMode {
+
+    private static final double TELEOP_LENGTH = 120;
+    private static final double ENDGAME_START = 60;
+    private static final double PARK_WARNING = 15;
 
     private static final double DEADZONE = 0.05;
     private static final double SLOW_SCALE = 0.35;
@@ -28,11 +38,11 @@ public class Priority extends OpMode {
     private static final double SLEW_RATE = 6.0;
 
     private static final double TICKS_PER_REV = 28.0;
-    private static final double RPM_NEAR = 2400;
-    private static final double RPM_MID = 2800;
-    private static final double RPM_FAR = 3200;
+    private static final double RPM_HIVE_NEAR = 2400;
+    private static final double RPM_HIVE_FAR = 3100;
+    private static final double RPM_FLOWER = 1200;
     private static final double RPM_TRIM_STEP = 50;
-    private static final double RPM_MIN = 1500;
+    private static final double RPM_MIN = 800;
     private static final double RPM_MAX = 4500;
     private static final double RPM_TOLERANCE = 80;
     private static final double READY_SETTLE = 0.08;
@@ -53,25 +63,40 @@ public class Priority extends OpMode {
     private static final double JAM_REVERSE_TIME = 0.3;
     private static final double JAM_REVERSE_POWER = -0.6;
 
+    private static final int MAX_HELD = 4;
+    private static final double BALL_PRESENT_CM = 4.0;
+    private static final float COLOR_GAIN = 8f;
+
     private static final double VOLTAGE_PERIOD = 0.5;
     private static final double CURRENT_PERIOD = 0.1;
 
     private enum Shooter { IDLE, SPINUP, READY, FEED, RECOVER }
+    private enum Target { HIVE_NEAR, HIVE_FAR, FLOWER }
+    private enum Ball { NONE, POLLEN, RED_NECTAR, BLUE_NECTAR, UNKNOWN }
+    private enum Alliance { RED, BLUE }
 
     private DcMotor fl, fr, bl, br;
     private DcMotorEx intake, launcher;
     private CRServo leftIntakeServo, rightIntakeServo, feedServo;
     private VoltageSensor battery;
     private IMU imu;
+    private NormalizedColorSensor ballColor;
+    private DistanceSensor ballDistance;
     private List<LynxModule> hubs;
 
+    private Alliance alliance = Alliance.BLUE;
     private Shooter shooter = Shooter.IDLE;
-    private double targetRPM = RPM_MID;
-    private String preset = "MID";
+    private Target target = Target.HIVE_NEAR;
+    private double targetRPM = RPM_HIVE_NEAR;
     private double rpm;
     private double feedStartRPM;
     private int shots;
     private boolean announcedReady;
+    private String blockedReason = "";
+
+    private Ball nextBall = Ball.NONE;
+    private boolean ballWasPresent;
+    private int held;
 
     private boolean slowMode;
     private boolean fieldCentric;
@@ -83,9 +108,13 @@ public class Priority extends OpMode {
     private double intakeAmps;
     private boolean unjamming;
 
-    private boolean lastSpin, lastFieldCentric, lastResetHeading;
-    private boolean lastPresetNear, lastPresetMid, lastPresetFar, lastTrimUp, lastTrimDown;
+    private boolean endgameAnnounced, parkAnnounced, fullAnnounced;
 
+    private boolean lastSpin, lastFire, lastFieldCentric, lastResetHeading, lastResetHeld;
+    private boolean lastNear, lastFar, lastFlower, lastTrimUp, lastTrimDown;
+    private boolean lastAllianceRed, lastAllianceBlue;
+
+    private final ElapsedTime matchTimer = new ElapsedTime();
     private final ElapsedTime loopTimer = new ElapsedTime();
     private final ElapsedTime shooterTimer = new ElapsedTime();
     private final ElapsedTime settleTimer = new ElapsedTime();
@@ -145,6 +174,12 @@ public class Priority extends OpMode {
             imu.resetYaw();
         }
 
+        ballColor = hardwareMap.tryGet(NormalizedColorSensor.class, "ball_color");
+        if (ballColor != null) {
+            ballColor.setGain(COLOR_GAIN);
+            if (ballColor instanceof DistanceSensor) ballDistance = (DistanceSensor) ballColor;
+        }
+
         voltage = battery.getVoltage();
         applyLauncherGains();
 
@@ -154,16 +189,24 @@ public class Priority extends OpMode {
 
         telemetry.setMsTransmissionInterval(50);
         telemetry.addData("Priority", "initialized");
-        telemetry.addData("imu", imu != null ? "found" : "missing, field centric disabled");
         telemetry.update();
     }
 
     @Override
     public void init_loop() {
+        boolean red = gamepad1.b || gamepad2.b;
+        boolean blue = gamepad1.x || gamepad2.x;
+        if (red && !lastAllianceRed) alliance = Alliance.RED;
+        if (blue && !lastAllianceBlue) alliance = Alliance.BLUE;
+        lastAllianceRed = red;
+        lastAllianceBlue = blue;
+
         telemetry.addData("Priority", "waiting for start");
+        telemetry.addData("alliance", "%s   (B = red, X = blue)", alliance);
         telemetry.addData("battery", "%.2f V", battery.getVoltage());
-        telemetry.addData("imu", imu != null ? "found" : "missing");
-        telemetry.addData("preset", "%s @ %.0f rpm", preset, targetRPM);
+        telemetry.addData("imu", imu != null ? "found" : "missing, field centric off");
+        telemetry.addData("ball sensor", ballColor != null ? "found" : "missing, nectar guard off");
+        telemetry.addData("target", "%s @ %.0f rpm", target, targetRPM);
         telemetry.update();
     }
 
@@ -171,6 +214,8 @@ public class Priority extends OpMode {
     public void start() {
         shooter = Shooter.IDLE;
         shots = 0;
+        held = 0;
+        matchTimer.reset();
         loopTimer.reset();
         voltageTimer.reset();
         currentTimer.reset();
@@ -186,6 +231,7 @@ public class Priority extends OpMode {
         loopMs = dt * 1000.0;
 
         readSensors();
+        matchCues();
         drive(dt);
         runIntake();
         runShooter();
@@ -196,6 +242,14 @@ public class Priority extends OpMode {
     @Override
     public void stop() {
         haltEverything();
+    }
+
+    private double timeLeft() {
+        return Math.max(0, TELEOP_LENGTH - matchTimer.seconds());
+    }
+
+    private boolean isEndgame() {
+        return timeLeft() <= ENDGAME_START;
     }
 
     private void readSensors() {
@@ -213,6 +267,66 @@ public class Priority extends OpMode {
         }
 
         if (imu != null) heading = imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS);
+
+        if (ballColor != null) {
+            nextBall = classifyBall();
+            boolean present = nextBall != Ball.NONE;
+            if (present && !ballWasPresent && held < MAX_HELD) held++;
+            ballWasPresent = present;
+        }
+    }
+
+    private Ball classifyBall() {
+        if (ballDistance != null && ballDistance.getDistance(DistanceUnit.CM) > BALL_PRESENT_CM) {
+            return Ball.NONE;
+        }
+
+        NormalizedRGBA c = ballColor.getNormalizedColors();
+        float[] hsv = new float[3];
+        Color.colorToHSV(c.toColor(), hsv);
+        float hue = hsv[0];
+        float sat = hsv[1];
+
+        if (ballDistance == null && c.alpha < 0.2f) return Ball.NONE;
+        if (sat < 0.25f) return Ball.UNKNOWN;
+        if (hue >= 35 && hue <= 80) return Ball.POLLEN;
+        if (hue < 25 || hue > 330) return Ball.RED_NECTAR;
+        if (hue >= 180 && hue <= 260) return Ball.BLUE_NECTAR;
+        return Ball.UNKNOWN;
+    }
+
+    private boolean isNectar(Ball b) {
+        return b == Ball.RED_NECTAR || b == Ball.BLUE_NECTAR;
+    }
+
+    private boolean isOurNectar(Ball b) {
+        return (alliance == Alliance.RED && b == Ball.RED_NECTAR)
+                || (alliance == Alliance.BLUE && b == Ball.BLUE_NECTAR);
+    }
+
+    private void matchCues() {
+        if (!endgameAnnounced && isEndgame()) {
+            endgameAnnounced = true;
+            gamepad1.rumbleBlips(3);
+            gamepad2.rumbleBlips(3);
+        }
+        if (!parkAnnounced && timeLeft() <= PARK_WARNING) {
+            parkAnnounced = true;
+            gamepad1.rumble(1000);
+            gamepad2.rumble(1000);
+        }
+        if (held >= MAX_HELD) {
+            if (!fullAnnounced) {
+                fullAnnounced = true;
+                gamepad1.rumbleBlips(2);
+            }
+        } else {
+            fullAnnounced = false;
+        }
+
+        boolean resetHeld = gamepad2.x;
+        if (resetHeld && !lastResetHeld) held = 0;
+        lastResetHeld = resetHeld;
     }
 
     private void drive(double dt) {
@@ -325,20 +439,20 @@ public class Priority extends OpMode {
         boolean spin = gamepad1.a || gamepad2.a;
         boolean fire = gamepad1.b || gamepad2.b;
         boolean near = gamepad1.dpad_down || gamepad2.dpad_down;
-        boolean mid = gamepad1.dpad_left || gamepad2.dpad_left;
         boolean far = gamepad1.dpad_up || gamepad2.dpad_up;
+        boolean flower = gamepad1.dpad_left || gamepad2.dpad_left;
         boolean trimUp = gamepad2.right_bumper;
         boolean trimDown = gamepad2.left_bumper;
 
-        if (near && !lastPresetNear) selectPreset("NEAR", RPM_NEAR);
-        if (mid && !lastPresetMid) selectPreset("MID", RPM_MID);
-        if (far && !lastPresetFar) selectPreset("FAR", RPM_FAR);
-        if (trimUp && !lastTrimUp) setTarget(targetRPM + RPM_TRIM_STEP);
-        if (trimDown && !lastTrimDown) setTarget(targetRPM - RPM_TRIM_STEP);
+        if (near && !lastNear) selectTarget(Target.HIVE_NEAR, RPM_HIVE_NEAR);
+        if (far && !lastFar) selectTarget(Target.HIVE_FAR, RPM_HIVE_FAR);
+        if (flower && !lastFlower) selectTarget(Target.FLOWER, RPM_FLOWER);
+        if (trimUp && !lastTrimUp) setRPM(targetRPM + RPM_TRIM_STEP);
+        if (trimDown && !lastTrimDown) setRPM(targetRPM - RPM_TRIM_STEP);
 
-        lastPresetNear = near;
-        lastPresetMid = mid;
-        lastPresetFar = far;
+        lastNear = near;
+        lastFar = far;
+        lastFlower = flower;
         lastTrimUp = trimUp;
         lastTrimDown = trimDown;
 
@@ -354,6 +468,13 @@ public class Priority extends OpMode {
         boolean inBand = Math.abs(rpm - targetRPM) < RPM_TOLERANCE;
         if (!inBand) settleTimer.reset();
         boolean atSpeed = inBand && settleTimer.seconds() > READY_SETTLE;
+
+        blockedReason = feedBlockReason();
+        if (fire && !lastFire && !blockedReason.isEmpty()) {
+            gamepad1.rumbleBlips(3);
+            gamepad2.rumbleBlips(3);
+        }
+        lastFire = fire;
 
         switch (shooter) {
             case IDLE:
@@ -376,7 +497,7 @@ public class Priority extends OpMode {
                 feedServo.setPower(0);
                 if (!inBand) {
                     shooter = Shooter.SPINUP;
-                } else if (fire) {
+                } else if (fire && blockedReason.isEmpty()) {
                     feedStartRPM = rpm;
                     shooterTimer.reset();
                     shooter = Shooter.FEED;
@@ -387,7 +508,10 @@ public class Priority extends OpMode {
                 feedServo.setPower(FEED_POWER);
                 boolean dipped = feedStartRPM - rpm > SHOT_DIP_RPM;
                 if (dipped || shooterTimer.seconds() > FEED_MAX_TIME) {
-                    if (dipped) shots++;
+                    if (dipped) {
+                        shots++;
+                        if (held > 0) held--;
+                    }
                     feedServo.setPower(0);
                     shooterTimer.reset();
                     shooter = Shooter.RECOVER;
@@ -403,12 +527,20 @@ public class Priority extends OpMode {
         }
     }
 
-    private void selectPreset(String name, double rpmTarget) {
-        preset = name;
-        setTarget(rpmTarget);
+    private String feedBlockReason() {
+        if (target != Target.FLOWER || ballColor == null || gamepad2.y) return "";
+        if (!isNectar(nextBall)) return "";
+        if (!isOurNectar(nextBall)) return "their nectar would give them the flower";
+        if (!isEndgame()) return "nectar in flower before endgame is a major foul";
+        return "";
     }
 
-    private void setTarget(double rpmTarget) {
+    private void selectTarget(Target t, double rpmTarget) {
+        target = t;
+        setRPM(rpmTarget);
+    }
+
+    private void setRPM(double rpmTarget) {
         targetRPM = Range.clip(rpmTarget, RPM_MIN, RPM_MAX);
         if (shooter != Shooter.IDLE) {
             launcher.setVelocity(rpmToTicks(targetRPM));
@@ -460,18 +592,26 @@ public class Priority extends OpMode {
     }
 
     private void showTelemetry() {
-        telemetry.addData("loop", "%.1f ms", loopMs);
-        telemetry.addData("battery", "%.2f V", voltage);
+        double left = timeLeft();
+        String phase = left <= PARK_WARNING ? "PARK NOW" : isEndgame() ? "ENDGAME  flowers open" : "TELEOP";
+        telemetry.addData("time", "%d:%02d  %s", (int) left / 60, (int) left % 60, phase);
+        telemetry.addData("alliance", alliance);
         telemetry.addLine();
-        telemetry.addData("shooter", shooter);
-        telemetry.addData("preset", "%s  target %.0f  actual %.0f", preset, targetRPM, rpm);
+        telemetry.addData("shooter", "%s  ->  %s", shooter, target);
+        telemetry.addData("rpm", "target %.0f  actual %.0f", targetRPM, rpm);
         telemetry.addData("shots", shots);
+        if (!blockedReason.isEmpty()) telemetry.addData("BLOCKED", blockedReason);
+        telemetry.addLine();
+        if (ballColor != null) {
+            telemetry.addData("next ball", nextBall);
+            telemetry.addData("held", "%d / %d%s", held, MAX_HELD, held >= MAX_HELD ? "  FULL" : "");
+        }
+        telemetry.addData("intake", "%s  %.2f A", unjamming ? "UNJAM" : "OK", intakeAmps);
         telemetry.addLine();
         telemetry.addData("drive", "%s%s", fieldCentric ? "FIELD" : "ROBOT", slowMode ? "  SLOW" : "");
         telemetry.addData("heading", "%.1f deg", Math.toDegrees(heading));
         telemetry.addData("wheels", "FL %.2f  FR %.2f  BL %.2f  BR %.2f", flPower, frPower, blPower, brPower);
-        telemetry.addLine();
-        telemetry.addData("intake", "%s  %.2f A", unjamming ? "UNJAM" : "OK", intakeAmps);
+        telemetry.addData("loop", "%.1f ms   battery %.2f V", loopMs, voltage);
         telemetry.update();
     }
 }
