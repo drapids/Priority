@@ -1,6 +1,7 @@
 package org.firstinspires.ftc.teamcode;
 
 import android.graphics.Color;
+import android.util.Size;
 
 import com.qualcomm.hardware.lynx.LynxModule;
 import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
@@ -19,9 +20,15 @@ import com.qualcomm.robotcore.hardware.VoltageSensor;
 import com.qualcomm.robotcore.util.ElapsedTime;
 import com.qualcomm.robotcore.util.Range;
 
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+
 import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.CurrentUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
+import org.firstinspires.ftc.robotcore.internal.system.AppUtil;
+import org.firstinspires.ftc.vision.VisionPortal;
+
+import java.io.File;
 
 import java.util.List;
 
@@ -67,6 +74,11 @@ public class Priority extends OpMode {
     private static final double BALL_PRESENT_CM = 4.0;
     private static final float COLOR_GAIN = 8f;
 
+    private static final String MODEL_FILE = "tflitemodels/nectar.tflite";
+    private static final float MODEL_CONFIDENCE = 0.4f;
+    private static final int MODEL_THREADS = 4;
+    private static final double AIM_OVERRIDE = 0.3;
+
     private static final double VOLTAGE_PERIOD = 0.5;
     private static final double CURRENT_PERIOD = 0.1;
 
@@ -83,6 +95,13 @@ public class Priority extends OpMode {
     private NormalizedColorSensor ballColor;
     private DistanceSensor ballDistance;
     private List<LynxModule> hubs;
+
+    private VisionPortal portal;
+    private NectarVision vision;
+    private NectarAimbot aimbot;
+    private String visionStatus = "off";
+    private boolean aimbotOn;
+    private boolean assisting;
 
     private Alliance alliance = Alliance.BLUE;
     private Shooter shooter = Shooter.IDLE;
@@ -113,6 +132,7 @@ public class Priority extends OpMode {
     private boolean lastSpin, lastFire, lastFieldCentric, lastResetHeading, lastResetHeld;
     private boolean lastNear, lastFar, lastFlower, lastTrimUp, lastTrimDown;
     private boolean lastAllianceRed, lastAllianceBlue;
+    private boolean lastAimbot;
 
     private final ElapsedTime matchTimer = new ElapsedTime();
     private final ElapsedTime loopTimer = new ElapsedTime();
@@ -180,6 +200,8 @@ public class Priority extends OpMode {
             if (ballColor instanceof DistanceSensor) ballDistance = (DistanceSensor) ballColor;
         }
 
+        startVision();
+
         voltage = battery.getVoltage();
         applyLauncherGains();
 
@@ -207,6 +229,7 @@ public class Priority extends OpMode {
         telemetry.addData("imu", imu != null ? "found" : "missing, field centric off");
         telemetry.addData("ball sensor", ballColor != null ? "found" : "missing, nectar guard off");
         telemetry.addData("target", "%s @ %.0f rpm", target, targetRPM);
+        telemetry.addData("nectar vision", visionStatus);
         telemetry.update();
     }
 
@@ -220,6 +243,7 @@ public class Priority extends OpMode {
         voltageTimer.reset();
         currentTimer.reset();
         if (imu != null) imu.resetYaw();
+        aimbot = new NectarAimbot(alliance == Alliance.RED ? NectarVision.RED_NECTAR : NectarVision.BLUE_NECTAR);
     }
 
     @Override
@@ -232,6 +256,7 @@ public class Priority extends OpMode {
 
         readSensors();
         matchCues();
+        runAimbot();
         drive(dt);
         runIntake();
         runShooter();
@@ -242,6 +267,59 @@ public class Priority extends OpMode {
     @Override
     public void stop() {
         haltEverything();
+        if (portal != null) portal.close();
+        if (vision != null) vision.close();
+    }
+
+    private void startVision() {
+        WebcamName camera = hardwareMap.tryGet(WebcamName.class, "Webcam 1");
+        File model = new File(AppUtil.ROOT_FOLDER, MODEL_FILE);
+        if (camera == null) {
+            visionStatus = "no Webcam 1, aimbot disabled";
+            return;
+        }
+        if (!model.exists()) {
+            visionStatus = "missing " + model.getPath();
+            return;
+        }
+        try {
+            vision = new NectarVision(model, MODEL_CONFIDENCE, MODEL_THREADS);
+            portal = new VisionPortal.Builder()
+                    .setCamera(camera)
+                    .setCameraResolution(new Size(640, 480))
+                    .setStreamFormat(VisionPortal.StreamFormat.MJPEG)
+                    .addProcessor(vision)
+                    .enableLiveView(true)
+                    .build();
+            visionStatus = "ready";
+        } catch (Throwable t) {
+            vision = null;
+            portal = null;
+            visionStatus = "failed: " + t.getMessage();
+        }
+    }
+
+    private void runAimbot() {
+        boolean toggle = gamepad1.dpad_right;
+        if (toggle && !lastAimbot) {
+            if (vision == null) {
+                gamepad1.rumbleBlips(3);
+            } else {
+                aimbotOn = !aimbotOn;
+                aimbot.reset();
+                gamepad1.rumbleBlips(aimbotOn ? 1 : 2);
+            }
+        }
+        lastAimbot = toggle;
+
+        if (!aimbotOn || vision == null) return;
+
+        if (ballColor != null && held >= MAX_HELD) {
+            aimbot.reset();
+            return;
+        }
+
+        aimbot.update(vision.latest(), heading);
     }
 
     private double timeLeft() {
@@ -342,6 +420,7 @@ public class Priority extends OpMode {
             imu.resetYaw();
             heading = 0;
             gamepad1.rumbleBlips(1);
+            if (aimbot != null) aimbot.reset();
         }
         lastResetHeading = resetPressed;
 
@@ -351,7 +430,14 @@ public class Priority extends OpMode {
         double strafe = shape(gamepad1.left_stick_x);
         double turn = shape(gamepad1.right_stick_x);
 
-        if (fieldCentric) {
+        boolean driverInput = Math.abs(forward) + Math.abs(strafe) + Math.abs(turn) > AIM_OVERRIDE;
+        assisting = aimbotOn && aimbot != null && aimbot.active && !driverInput;
+
+        if (assisting) {
+            forward = aimbot.forward;
+            strafe = 0;
+            turn = aimbot.turn;
+        } else if (fieldCentric) {
             double cos = Math.cos(-heading);
             double sin = Math.sin(-heading);
             double rotStrafe = strafe * cos - forward * sin;
@@ -362,7 +448,7 @@ public class Priority extends OpMode {
 
         strafe *= STRAFE_FIX;
 
-        if (slowMode) {
+        if (slowMode && !assisting) {
             forward *= SLOW_SCALE;
             strafe *= SLOW_SCALE;
             turn *= SLOW_SCALE;
@@ -402,6 +488,7 @@ public class Priority extends OpMode {
         double in = Math.max(gamepad1.right_trigger, gamepad2.right_trigger);
         double out = Math.max(gamepad1.left_trigger, gamepad2.left_trigger);
         double power = in - out;
+        if (power == 0 && assisting && aimbot.wantIntake) power = 1.0;
 
         if (unjamming) {
             if (unjamTimer.seconds() > JAM_REVERSE_TIME) {
@@ -608,6 +695,15 @@ public class Priority extends OpMode {
         }
         telemetry.addData("intake", "%s  %.2f A", unjamming ? "UNJAM" : "OK", intakeAmps);
         telemetry.addLine();
+        if (aimbotOn) {
+            String state = aimbot.isLocked()
+                    ? String.format("LOCKED  %.0f in  %.0f deg  %.2f", aimbot.range, aimbot.bearingDeg, aimbot.confidence)
+                    : aimbot.coasting ? "COLLECTING" : "SEARCHING";
+            telemetry.addData("aimbot", "%s%s", state, assisting ? "" : "  (driver)");
+            telemetry.addData("vision", "%.0f ms", vision.inferenceMs());
+        } else {
+            telemetry.addData("aimbot", "OFF  (dpad right)  %s", visionStatus);
+        }
         telemetry.addData("drive", "%s%s", fieldCentric ? "FIELD" : "ROBOT", slowMode ? "  SLOW" : "");
         telemetry.addData("heading", "%.1f deg", Math.toDegrees(heading));
         telemetry.addData("wheels", "FL %.2f  FR %.2f  BL %.2f  BR %.2f", flPower, frPower, blPower, brPower);
