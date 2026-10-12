@@ -1,5 +1,5 @@
 # Priority
-priority is the pinnacle of code
+priority is ai aimbot for FTC robots.
 
 ## OpModes
 - **Priority**: TeleOp
